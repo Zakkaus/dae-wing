@@ -236,7 +236,8 @@ func auth(next http.Handler) http.Handler {
 		ctx := context.Background()
 		if err == nil {
 			if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-				if expireAt, err := token.Claims.GetExpirationTime(); err == nil && time.Now().Before(expireAt.Time) {
+				// GetExpirationTime returns (nil, nil) for a token without exp.
+				if expireAt, err := token.Claims.GetExpirationTime(); err == nil && expireAt != nil && time.Now().Before(expireAt.Time) {
 					ctx = context.WithValue(ctx, "role", claims["role"])
 					ctx = context.WithValue(ctx, "user", &user)
 				}
