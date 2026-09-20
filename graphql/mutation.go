@@ -256,16 +256,7 @@ func (r *MutationResolver) SelectConfig(args *struct {
 func (r *MutationResolver) Run(args *struct {
 	Dry bool
 }) (int32, error) {
-	tx := db.BeginTx(context.TODO())
-	ret, err := config.Run(tx, args.Dry)
-	if err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	if err = tx.Commit().Error; err != nil {
-		return 0, fmt.Errorf("commit run: %w", err)
-	}
-	return ret, nil
+	return config.Run(context.TODO(), args.Dry)
 }
 
 func (r *MutationResolver) CreateDns(args *struct {

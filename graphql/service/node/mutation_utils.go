@@ -96,6 +96,10 @@ func Update(d *gorm.DB, _id graphql.ID, link string) (r *Resolver, err error) {
 	if q.RowsAffected == 0 {
 		return nil, fmt.Errorf("standalone node %s not found", _id)
 	}
+	// A changed link changes the running config of every group using it.
+	if err = AutoUpdateVersionByIds(d, []uint{id}); err != nil {
+		return nil, err
+	}
 	if err = d.First(newModel, id).Error; err != nil {
 		return nil, fmt.Errorf("reload node %s: %w", _id, err)
 	}
@@ -105,6 +109,7 @@ func Update(d *gorm.DB, _id graphql.ID, link string) (r *Resolver, err error) {
 }
 
 func AutoUpdateVersionByIds(d *gorm.DB, ids []uint) (err error) {
+	db.NoteNodeChange()
 	var sys db.System
 	if err = d.Model(&db.System{}).
 		FirstOrCreate(&sys).Error; err != nil {

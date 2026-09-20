@@ -7,6 +7,7 @@ package config
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"reflect"
@@ -22,6 +23,7 @@ import (
 	daeConfig "github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/graph-gophers/graphql-go"
+	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -258,7 +260,7 @@ func Rename(ctx context.Context, _id graphql.ID, name string) (n int32, err erro
 
 var runLock sync.Mutex
 
-func Run(d *gorm.DB, noLoad bool) (n int32, err error) {
+func Run(ctx context.Context, noLoad bool) (n int32, err error) {
 	if ok := runLock.TryLock(); !ok {
 		return 0, fmt.Errorf("the last request didn't complete; make a cup of tea and take a break")
 	}
@@ -275,14 +277,7 @@ func Run(d *gorm.DB, noLoad bool) (n int32, err error) {
 			return 0, fmt.Errorf("failed to dryrun: %w; see more in log and report bugs", err)
 		}
 
-		// Running -> false
-		var sys db.System
-		if err = d.Model(&db.System{}).FirstOrCreate(&sys).Error; err != nil {
-			return 0, err
-		}
-		if err = d.Model(&sys).Updates(map[string]interface{}{
-			"running": false,
-		}).Error; err != nil {
+		if err = persistRunningState(ctx, db.System{}, db.ChangeEpoch()); err != nil {
 			return 0, err
 		}
 		return 1, nil
@@ -290,6 +285,12 @@ func Run(d *gorm.DB, noLoad bool) (n int32, err error) {
 
 	//// Run selected global+dns+routing.
 	/// Get them from database and parse them to daeConfig.
+	epoch := db.ChangeEpoch()
+	d := db.BeginReadOnlyTx(ctx)
+	if d.Error != nil {
+		return 0, fmt.Errorf("begin run snapshot: %w", d.Error)
+	}
+	defer d.Rollback()
 	var mConfig db.Config
 	var mDns db.Dns
 	var mRouting db.Routing
@@ -453,6 +454,27 @@ func Run(d *gorm.DB, noLoad bool) (n int32, err error) {
 		c.Node = append(c.Node, daeConfig.KeyableString(fmt.Sprintf("%v:%v", node.uniqueName, node.dbNode.Link)))
 	}
 
+	snapshot := db.System{
+		Running:               true,
+		RunningConfigID:       &mConfig.ID,
+		RunningConfigVersion:  mConfig.Version,
+		RunningDnsID:          &mDns.ID,
+		RunningDnsVersion:     mDns.Version,
+		RunningRoutingID:      &mRouting.ID,
+		RunningRoutingVersion: mRouting.Version,
+	}
+	var gids []string
+	for _, g := range groups {
+		snapshot.RunningGroupVersionSum += g.Version
+		gids = append(gids, fmt.Sprintf("%x", g.ID))
+		snapshot.RunningGroups = append(snapshot.RunningGroups, db.Group{ID: g.ID, Version: g.Version})
+	}
+	sort.Strings(gids)
+	snapshot.RunningGroupIds = strings.Join(gids, ",")
+	if err = d.Commit().Error; err != nil {
+		return 0, fmt.Errorf("commit run snapshot: %w", err)
+	}
+
 	/// Reload with current config.
 	chReloadCallback := make(chan error)
 	dae.ChReloadConfigs <- &dae.ReloadMessage{
@@ -464,36 +486,91 @@ func Run(d *gorm.DB, noLoad bool) (n int32, err error) {
 		return 0, fmt.Errorf("failed to load new config: %w; see more in log", errReload)
 	}
 
-	// Save running status
-	var sys db.System
-	if err = d.Model(&db.System{}).FirstOrCreate(&sys).Error; err != nil {
-		return 0, err
-	}
-	var gvs uint
-	var gids []string
-	for _, g := range groups {
-		gvs += g.Version
-		gids = append(gids, fmt.Sprintf("%x", g.ID))
-	}
-	sort.Slice(gids, func(i, j int) bool {
-		return gids[i] < gids[j]
-	})
-	if err = d.Model(&sys).Updates(map[string]interface{}{
-		"running":                   true,
-		"running_config_id":         mConfig.ID,
-		"running_config_version":    mConfig.Version,
-		"running_dns_id":            mDns.ID,
-		"running_dns_version":       mDns.Version,
-		"running_routing_id":        mRouting.ID,
-		"running_routing_version":   mRouting.Version,
-		"running_group_version_sum": gvs,
-		"running_group_ids":         strings.Join(gids, ","),
-	}).Error; err != nil {
-		return 0, err
-	}
-	if err = d.Model(&sys).Association("RunningGroups").Replace(groups); err != nil {
+	if err = persistRunningState(ctx, snapshot, epoch); err != nil {
 		return 0, err
 	}
 
 	return 1, nil
+}
+
+// ErrPersistRunningState marks a failure after the reload itself succeeded:
+// the plane runs the new configuration, only the record of it is missing.
+var ErrPersistRunningState = errors.New("persist running state")
+
+// persistRunningState writes the snapshot Run loaded. snapshotEpoch is the
+// change counter when the snapshot was taken: a node or subscription change
+// since then could not bump the versions of groups that were not running
+// yet, so their versions are bumped here and Modified() reports the stale
+// plane. The counter is compared only after the first write has taken the
+// database lock, so a change cannot slip between the comparison and the
+// commit; anything later runs against a running group and bumps versions
+// itself.
+func persistRunningState(ctx context.Context, snapshot db.System, snapshotEpoch uint64) (err error) {
+	updates := map[string]interface{}{"running": snapshot.Running}
+	if snapshot.Running {
+		updates["running_config_id"] = *snapshot.RunningConfigID
+		updates["running_config_version"] = snapshot.RunningConfigVersion
+		updates["running_dns_id"] = *snapshot.RunningDnsID
+		updates["running_dns_version"] = snapshot.RunningDnsVersion
+		updates["running_routing_id"] = *snapshot.RunningRoutingID
+		updates["running_routing_version"] = snapshot.RunningRoutingVersion
+		updates["running_group_version_sum"] = snapshot.RunningGroupVersionSum
+		updates["running_group_ids"] = snapshot.RunningGroupIds
+	}
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("%w: %w", ErrPersistRunningState, err)
+			versions := make(map[uint]uint, len(snapshot.RunningGroups))
+			for _, g := range snapshot.RunningGroups {
+				versions[g.ID] = g.Version
+			}
+			// Keep the new plane running: restoring the old config would disrupt it again.
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"snapshot": updates, "group_versions": versions,
+			}).Error("Reload succeeded but running state was not persisted")
+		}
+	}()
+	return db.DB(ctx).Connection(func(conn *gorm.DB) error {
+		tx := conn.Begin(&sql.TxOptions{Isolation: sql.LevelSerializable})
+		if tx.Error != nil {
+			return tx.Error
+		}
+		defer tx.Rollback()
+		var sys db.System
+		if err := tx.Select("id").FirstOrCreate(&sys).Error; err != nil {
+			return err
+		}
+		if snapshot.Running {
+			// Update only membership; saving stale group models could recreate deleted rows.
+			if err := tx.Model(&db.Group{}).Where("system_id = ?", sys.ID).Update("system_id", nil).Error; err != nil {
+				return err
+			}
+			ids := make([]uint, 0, len(snapshot.RunningGroups))
+			for _, g := range snapshot.RunningGroups {
+				ids = append(ids, g.ID)
+			}
+			if len(ids) > 0 {
+				if err := tx.Model(&db.Group{}).Where("id IN ?", ids).Update("system_id", sys.ID).Error; err != nil {
+					return err
+				}
+				if db.ChangeEpoch() != snapshotEpoch {
+					if err := tx.Model(&db.Group{}).Where("id IN ?", ids).Update("version", gorm.Expr("version + 1")).Error; err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if err := tx.Model(&sys).Updates(updates).Error; err != nil {
+			return err
+		}
+		if err := tx.Commit().Error; err != nil {
+			// A COMMIT that fails on a deferred constraint leaves the SQLite
+			// transaction open even though database/sql considers the Tx done;
+			// roll it back explicitly or the next statement on this connection
+			// commits the rejected state.
+			conn.WithContext(context.WithoutCancel(ctx)).Exec("ROLLBACK")
+			return err
+		}
+		return nil
+	})
 }
